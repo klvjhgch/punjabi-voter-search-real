@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: punjabi-voter-search-real
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: DATA_DIR
+        value: /var/data
+      - key: UPLOAD_DIR
+        value: /var/data/uploads
+    disk:
+      name: voter-data
+      mountPath: /var/data
+      sizeGB: 10
