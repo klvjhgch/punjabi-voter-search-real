@@ -168,14 +168,18 @@ function processPDF(pdfPath, uploadId, username) {
    const workerPath=path.join(__dirname,'ocr_worker.py');
    const py=spawn('python3',[workerPath,pdfPath],{stdio:['ignore','pipe','pipe']});
    let stdout=''; let stderr='';
+   const timeout=setTimeout(()=>{ try{py.kill('SIGKILL')}catch{}; }, 15*60*1000);
    py.stdout.on('data',d=>stdout+=d.toString());
    py.stderr.on('data',d=>stderr+=d.toString());
    py.on('error',reject);
    py.on('close',code=>{
+     clearTimeout(timeout);
      if(code!==0) return reject(new Error((stderr||`OCR worker exited with code ${code}`).slice(-4000)));
      let result;
      try { result=JSON.parse(stdout); } catch { return reject(new Error('OCR worker returned invalid JSON. '+stderr.slice(-1000))); }
+     if(result && result.ok===false) return reject(new Error(result.error || 'OCR worker failed'));
      if(!Array.isArray(result.rows)) return reject(new Error('OCR worker returned no voter rows'));
+     if(result.rows.length===0) return reject(new Error((result.warnings&&result.warnings[0]) || 'No voter records were detected in this PDF.'));
      const rows=result.rows.filter(r=>r && /^\d+$/.test(String(r.serial_no||'')));
      const insert=db.prepare(`INSERT OR REPLACE INTO voters(upload_id,serial_no,name,father_husband,relation,epic,age,gender,house_no,part_no,page_no,photo_key,raw_text) VALUES(@upload_id,@serial_no,@name,@father_husband,@relation,@epic,@age,@gender,@house_no,@part_no,@page_no,@photo_key,@raw_text)`);
      const tx=db.transaction(items=>{ db.prepare('DELETE FROM voters WHERE upload_id=?').run(uploadId); for(const r of items) insert.run({...r,upload_id:uploadId,serial_no:String(r.serial_no),part_no:String(r.part_no||result.part_no||'')}); });
@@ -234,7 +238,11 @@ app.get('/api/voters',auth,requirePerm('search'),(req,res)=>{
   res.json({total,rows,limit,offset});
 });
 
-app.get('/api/voter-photo/:id',auth,requirePerm('search'),async(req,res)=>{
+app.get('/api/voter-photo/:id',(req,res,next)=>{
+ const q=String(req.query.token||'');
+ if(q && !req.headers.authorization) req.headers.authorization='Bearer '+q;
+ auth(req,res,next);
+},requirePerm('search'),async(req,res)=>{
  const v=db.prepare(`SELECT v.*,u.file_path FROM voters v JOIN uploads u ON u.id=v.upload_id WHERE v.id=?`).get(Number(req.params.id));
  if(!v || !v.file_path || !fs.existsSync(v.file_path)) return res.status(404).end();
  const m=String(v.photo_key||'').match(/^([^:]+):([^:]+):([^:]+)$/);
