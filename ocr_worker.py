@@ -18,6 +18,7 @@ PAGE_SCALE = float(os.getenv('OCR_PAGE_SCALE', '1.45'))
 CARD_SCALE = float(os.getenv('OCR_CARD_SCALE', '2.2'))
 MAX_CARD_OCR = int(os.getenv('OCR_MAX_CARD_OCR', '2500'))
 MAX_PARALLEL = max(1, min(int(os.getenv('OCR_PARALLEL', '2')), 4))
+EMBED_OCR_SCALE = float(os.getenv('OCR_EMBED_SCALE', '3.0'))
 
 
 def progress(pct, stage, page=None, pages=None):
@@ -49,99 +50,148 @@ def is_noise(s):
 
 
 def part_no(doc):
-    # Part/Booth is a document-level identifier. Never derive it from voter markers.
-    sample = '\n'.join(doc[i].get_text('text') for i in range(min(5, len(doc))))
-    patterns = [
-        r'(?:Booth|ਬੂਥ|ਬਥ|बूथ)\s*(?:No\.?|ਨੰ\.?|ਨੰਬਰ|नं\.?|Number)?\s*[:\-]?\s*(\d{1,5})',
-        r'(?:Part\s*(?:No\.?|Number)?|ਪਾਰਟ\s*(?:ਨੰ\.?|ਨੰਬਰ)?)\s*[:\-]?\s*(\d{1,5})'
+    # This roll prints: "ਵਾਰਡ ਨੰ.: 77  ਬੂਥ ਨੰ.: 3". The Booth Number is the Part Number.
+    # Never use 16/20/xxx, ws-xxxx, or the Ward Number as the Part Number.
+    sample='\n'.join(doc[i].get_text('text') for i in range(min(3,len(doc))))
+    patterns=[
+        r'(?:Booth|ਬੂਥ|ਬਬਥ|ਬਥ)\s*(?:No\.?|ਨੰ\.?|ਨੰਬਰ|ਨਅ\.?|Number)?\s*[:\-]?\s*(\d{1,5})',
+        r'\bOB\s*[:\-]?\s*(\d{1,5})\b',
     ]
     for pat in patterns:
-        m = re.search(pat, sample, re.I)
-        if m: return m.group(1)
-    m = re.search(r'booth[_\s-]*(\d{1,5})', os.path.basename(PDF), re.I)
+        m=re.search(pat,sample,re.I)
+        if m:return m.group(1)
+    name=os.path.basename(PDF)
+    m=re.search(r'(?:booth|bth|ob)[_\s-]*(\d{1,5})',name,re.I)
     return m.group(1) if m else ''
 
 
-def text_fields(blocks, x0, y0):
-    card=[b for b in blocks if b[0] >= x0-8 and b[0] <= x0+185 and b[1] >= y0-6 and b[1] <= y0+82]
-    epic=''; house=''; age=None; gender=''; rel=''; candidates=[]
-    for b in card:
-        bx,by,bx1,by1,t=b[:5]; s=clean(t)
-        if not s: continue
-        em=EPIC_RE.search(s.upper())
-        if em: epic=em.group(0).upper()
-        if x0+18 <= bx <= x0+120 and y0+35 <= by <= y0+65 and not re.search(r'(ਨੰ|house|मकान|ਨਪਮ)',s,re.I):
-            if not house: house=s
-        if y0+48 <= by <= y0+82:
-            m=re.search(r'(?<!\d)(\d{1,3})(?!\d)',s)
-            if m and age is None: age=int(m.group(1))
-            if re.search(r'(ਮਰਦ|ਔਰਤ|ਪੁਰਸ਼|ਪੁਰਸ਼|ਇਸਤਰੀ|female|male|other|ਲਿੰਗ|gender)',s,re.I): gender=s
-        if x0-4 <= bx <= x0+40 and y0+18 <= by <= y0+52 and not is_noise(s): rel=s
-        if not is_noise(s) and len(s) >= 2 and not EPIC_RE.search(s.upper()): candidates.append(s)
-    # Best non-label name candidate from the card's text layer.
-    pan=[s for s in candidates if re.search(r'[\u0A00-\u0A7F]',s)]
-    name=(pan[0] if pan else (candidates[0] if candidates else ''))
-    return name, epic, house, age, gender, rel
+def normalize_gender(s):
+    s=clean(s)
+    if not s:return ''
+    if re.search(r'(?:ਪੁਰਸ਼|ਪੁਰਸ਼|ਪਪਰਸ਼|ਪਰਸ਼|male|ਮਰਦ)',s,re.I):return 'ਪੁਰਸ਼'
+    if re.search(r'(?:ਇਸਤਰੀ|ਇਸਤ੍ਰੀ|ਇਸਤਰਤ|female|ਔਰਤ)',s,re.I):return 'ਇਸਤਰੀ'
+    if re.search(r'(?:ਹੋਰ|ਅਦਰ|other)',s,re.I):return 'ਹੋਰ'
+    return s
 
 
-def ocr_image(img, config='--oem 1 --psm 11'):
-    try:
-        return pytesseract.image_to_string(img, lang='pan+eng', config=config)
-    except Exception:
-        return pytesseract.image_to_string(img, lang='eng', config=config)
+def normalize_relation(s):
+    s=clean(s)
+    if not s:return ''
+    # OCR/text-layer variants seen in this electoral-roll layout.
+    if re.search(r'(?:ਪਿਤਾ|ਤਪਤਪ|father)',s,re.I):return 'ਪਿਤਾ'
+    if re.search(r'(?:ਪਤੀ|ਪਤਤ|husband)',s,re.I):return 'ਪਤੀ'
+    if re.search(r'(?:ਅਦਰ|ਹੋਰ|other)',s,re.I):return 'ਹੋਰ'
+    if re.search(r'(?:ਮਾਤਾ|mother)',s,re.I):return 'ਮਾਤਾ'
+    if re.search(r'(?:ਪੁੱਤਰ|ਪੁਤਰ|son)',s,re.I):return 'ਪੁੱਤਰ'
+    if re.search(r'(?:ਪੁਤਰੀ|ਪੁੱਤਰੀ|daughter)',s,re.I):return 'ਪੁਤਰੀ'
+    return s
 
 
-def ocr_card(page, x0, y0, scale=CARD_SCALE):
-    r=fitz.Rect(max(0,x0-2),max(0,y0-2),min(page.rect.width,x0+180),min(page.rect.height,y0+78))
-    pix=page.get_pixmap(matrix=fitz.Matrix(scale,scale), clip=r, alpha=False)
+def crop_ocr(page, rect, psm=6):
+    pix=page.get_pixmap(matrix=fitz.Matrix(6,6),clip=fitz.Rect(*rect),alpha=False)
     img=Image.frombytes('RGB',[pix.width,pix.height],pix.samples)
-    g=ImageOps.autocontrast(ImageOps.grayscale(img))
-    txt=ocr_image(g)
-    ls=lines(txt)
-    voter=''; relative=''; relation=''
-    for i,l in enumerate(ls):
-        if re.fullmatch(r'(ਨਾਮ|Name|नाम)\s*[:：-]?',l,re.I) and i+1<len(ls): voter=ls[i+1]
-        if REL_RE.match(l):
-            relation=l
-            if i+1<len(ls) and not is_noise(ls[i+1]): relative=ls[i+1]
-            if not voter:
-                prev=[x for x in ls[:i] if not is_noise(x)]
-                if prev: voter=prev[-1]
-            break
-    if not voter:
-        cand=[l for l in ls if not is_noise(l) and len(l)>=2]
-        pan=[l for l in cand if re.search(r'[\u0A00-\u0A7F]',l)]
-        voter=pan[0] if pan else (cand[0] if cand else '')
-    if not relative:
-        for i,l in enumerate(ls):
-            if REL_RE.match(l) and i+1<len(ls) and not is_noise(ls[i+1]):
-                relation=l; relative=ls[i+1]; break
-    return clean(voter),clean(relative),clean(relation),clean(txt)
+    # Preserve the original print strokes; light autocontrast helps compressed scans.
+    img=ImageOps.autocontrast(ImageOps.grayscale(img))
+    try:return clean(pytesseract.image_to_string(img,lang='pan',config=f'--oem 1 --psm {psm}'))
+    except Exception:
+        try:return clean(pytesseract.image_to_string(img,lang='pan+eng',config=f'--oem 1 --psm {psm}'))
+        except Exception:return ''
 
 
-def embedded_rows(page, pno, part):
+def page_ocr_words(page, scale=4.0):
+    pix=page.get_pixmap(matrix=fitz.Matrix(scale,scale),alpha=False)
+    img=Image.frombytes('RGB',[pix.width,pix.height],pix.samples)
+    try:
+        data=pytesseract.image_to_data(img,lang='pan',config='--oem 1 --psm 11',output_type=pytesseract.Output.DICT)
+    except Exception:
+        data=pytesseract.image_to_data(img,lang='pan+eng',config='--oem 1 --psm 11',output_type=pytesseract.Output.DICT)
+    out=[]
+    for i,t in enumerate(data.get('text',[])):
+        t=clean(t)
+        if not t: continue
+        try: conf=float(data['conf'][i])
+        except: conf=0
+        out.append({'t':t,'x':int(data['left'][i])/scale,'y':int(data['top'][i])/scale,
+                    'w':int(data['width'][i])/scale,'h':int(data['height'][i])/scale,'conf':conf})
+    return out
+
+
+def words_in(words,x1,y1,x2,y2):
+    return sorted([w for w in words if x1<=w['x']<=x2 and y1<=w['y']<=y2],key=lambda w:(w['y'],w['x']))
+
+
+def join_words(ws):
+    if not ws:return ''
+    # Tesseract may place two words on the same printed line at slightly different
+    # y-coordinates. Cluster by baseline first, then preserve left-to-right order.
+    ordered=sorted(ws,key=lambda w:(w['y'],w['x']))
+    groups=[]
+    for w in ordered:
+        if not groups or abs(w['y']-groups[-1][0])>3.0:
+            groups.append([w['y'],[w]])
+        else:
+            groups[-1][1].append(w)
+            groups[-1][0]=(groups[-1][0]+w['y'])/2
+    return clean(' '.join(w['t'] for _,items in groups for w in sorted(items,key=lambda z:z['x'])))
+
+
+def normalize_name_text(s):
+    s=clean(s)
+    s=re.sub(r'[_|`~]+','',s)
+    s=re.sub(r'\s*[-–—]+\s*$','',s)
+    # A few stable OCR substitutions in this Punjabi electoral-roll font.
+    s=re.sub(r'(?<!\S)ਕਮਾਰ(?!\S)','ਕੁਮਾਰ',s)
+    s=re.sub(r'(?<!\S)ਕੋਰ(?!\S)','ਕੌਰ',s)
+    return clean(s)
+
+
+def exact_card_fields(page,x0,y0,ocr_words=None):
     blocks=page.get_text('blocks')
-    rows=[]
+    # Tight vertical band prevents an adjacent row's EPIC/fields from leaking into this card.
+    card=[b for b in blocks if b[0]>=x0-3 and b[0]<=x0+173 and b[1]>=y0-3 and b[1]<=y0+69]
+    epic=''; house=''; age=None; gender=''; relation=''
+    for b in card:
+        bx,by,bx1,by1,t=b[:5]; ss=clean(t)
+        em=EPIC_RE.search(ss.upper())
+        if em and by<=y0+15: epic=em.group(0).upper()
+        if abs(by-(y0+47))<7 and x0+25<=bx<=x0+85 and not re.search(r'(?:ਮਕਾਨ|ਮਪਪਨ|house|ਜਲਨਗ)',ss,re.I):
+            house=ss
+        if abs(by-(y0+59))<8 and x0+30<=bx<=x0+155:
+            m=re.search(r'(?<!\d)(\d{1,3})(?!\d)',ss)
+            if m: age=int(m.group(1))
+            gender=normalize_gender(ss)
+        if abs(by-(y0+32))<9 and x0-1<=bx<=x0+10:
+            relation=normalize_relation(ss)
+    if ocr_words:
+        # Exact printed coordinates for this 3-column/10-row electoral-roll grid.
+        nw=[w for w in words_in(ocr_words,x0+28,y0+14,x0+155,y0+25) if w['conf']>=45]
+        fw=[w for w in words_in(ocr_words,x0+15,y0+24,x0+165,y0+42.5) if w['conf']>=15]
+        name=join_words(nw)
+        father=join_words(fw)
+        # The father/relative line may include the relation label when OCR spans both.
+        m=re.match(r'^(ਪਿਤਾ|ਪਤੀ|ਮਾਤਾ|ਪੁੱਤਰ|ਪੁਤਰੀ|father|husband|mother|son|daughter)\s+(.+)$',father,re.I)
+        if m:
+            relation=normalize_relation(m.group(1)); father=clean(m.group(2))
+        # Drop common OCR punctuation/noise at the ends.
+        name=normalize_name_text(name)
+        father=normalize_name_text(father)
+        # Remove obvious field labels accidentally captured by OCR.
+        name=re.sub(r'^(?:ਨਾਮ|Name)\s*[:：-]?\s*','',name,flags=re.I)
+        father=re.sub(r'^(?:ਪਿਤਾ|ਪਤੀ|ਮਾਤਾ|ਪੁੱਤਰ|ਪੁਤਰੀ|father|husband|mother|son|daughter)\s*[:：-]?\s*','',father,flags=re.I)
+    return name if 'name' in locals() else '', father if 'father' in locals() else '', relation, epic, age, gender, house
+
+
+def embedded_rows(page, pno, part, ocr_words=None):
+    blocks=page.get_text('blocks'); rows=[]
     marker_blocks=[b for b in blocks if is_marker(b[4])]
     for b in marker_blocks:
-        text=clean(b[4]); ls=lines(b[4]); serial=None
-        for l in ls:
+        text=clean(b[4]); serial=None
+        for l in reversed(lines(b[4])):
             if SERIAL_RE.fullmatch(l) and not MARK_RE.fullmatch(l): serial=int(l); break
-        if serial is None:
-            near=sorted((abs(c[1]-b[1])+abs(c[0]-b[0]),c) for c in blocks if c is not b and abs(c[0]-b[0])<40 and abs(c[1]-b[1])<34)
-            for _,c in near:
-                val=clean(c[4])
-                if SERIAL_RE.fullmatch(val): serial=int(val); break
         if serial is None: continue
         x0,y0=b[0],b[1]
-        name0,epic,house,age,gender,rel=text_fields(blocks,x0,y0)
-        # Embedded PDFs should not invoke Tesseract for every voter. OCR only when the text layer
-        # failed to provide a plausible name/relative, which is the expensive path.
-        if name0 and (re.search(r'[\u0A00-\u0A7F]', name0) or len(name0) >= 3):
-            name,father,ocrrel,raw=name0,rel,rel,text
-        else:
-            name,father,ocrrel,raw=ocr_card(page,x0,y0)
-        rows.append({'serial_no':str(serial),'name':name,'father_husband':father,'relation':ocrrel or rel,'epic':epic,'age':age,'gender':gender,'house_no':house,'part_no':part,'page_no':pno,'photo_key':f'{pno}:{x0}:{y0}','raw_text':raw})
+        name,father,relation,epic,age,gender,house=exact_card_fields(page,x0,y0,ocr_words)
+        rows.append({'serial_no':str(serial),'name':name,'father_husband':father,'relation':relation,'epic':epic,'age':age,'gender':gender,'house_no':house,'part_no':part,'page_no':pno,'photo_key':f'{pno}:{x0}:{y0}','raw_text':text})
     return rows
 
 
@@ -188,8 +238,11 @@ def scanned_candidates(page):
 
 def scanned_row(page,pno,part,item):
     x,y,serial=item
-    name,father,relation,raw=ocr_card(page,x,y)
-    return {'serial_no':str(serial),'name':name,'father_husband':father,'relation':relation,'epic':'','age':None,'gender':'','house_no':'','part_no':part,'page_no':pno,'photo_key':f'{pno}:{x}:{y}','raw_text':raw}
+    name,father,relation,epic,age,gender,house=exact_card_fields(page,x,y)
+    if not name or not father:
+        n,f,r,raw=ocr_card(page,x,y)
+        name=name or n; father=father or f; relation=relation or r
+    return {'serial_no':str(serial),'name':name,'father_husband':father,'relation':relation,'epic':epic,'age':age,'gender':gender,'house_no':house,'part_no':part,'page_no':pno,'photo_key':f'{pno}:{x}:{y}','raw_text':''}
 
 
 def main():
@@ -198,10 +251,12 @@ def main():
     for idx in range(total):
         pno=idx+1; page=doc[idx]
         text=page.get_text('text')
-        er=embedded_rows(page,pno,part)
+        # The embedded text has correct field geometry but corrupted Punjabi Unicode mapping.
+        # One 4x page OCR pass restores the printed Punjabi names/relative names/gender.
+        er=embedded_rows(page,pno,part,page_ocr_words(page,EMBED_OCR_SCALE) if text.strip() else None)
         if er:
             rows.extend(er)
-            progress(10 + int(78*(pno/total)), 'Reading embedded text', pno, total)
+            progress(10 + int(78*(pno/total)), 'Reading embedded text + Punjabi OCR', pno, total)
             continue
         # OCR only pages that actually need it. Cover/header pages are skipped when there is no
         # marker signal; image-only voter pages are OCR'd once, not once for every text block.

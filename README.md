@@ -31,3 +31,6 @@ Default admin username: `admin`.
 - Conservative parallel card OCR and configurable OCR environment variables reduce CPU/RAM pressure on Render.
 - Worker progress is reported to the server, so the UI no longer artificially stops at 88%; it shows the worker stage/page and reaches 100% only after database insertion completes.
 - OCR worker timeout is 20 minutes with a clear Processing History error.
+
+## V4 field extraction
+For the supplied Punjab electoral-roll layout, Punjabi name/relative fields are restored with one page-level Punjabi OCR pass while EPIC, house, age and serial use the PDF text geometry. Booth No. is used as Part No. and voter photo coordinates are preserved.

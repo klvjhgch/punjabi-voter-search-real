@@ -1,1 +1,1 @@
-OCR JSON/progress parser fix v2 - 2026-09-16
+Fixed V4 - accurate Punjabi OCR fields for the supplied Punjab voter-roll layout; Booth=Part; voter photos; Super Admin profile editing.

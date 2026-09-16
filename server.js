@@ -328,6 +328,28 @@ app.get('/api/export/:id',auth,requirePerm('history'),(req,res)=>{
  res.json({upload:u,voters});
 });
 
+app.get('/api/profile',auth,(req,res)=>{
+ const u=db.prepare('SELECT id,username,email,role,active,created_at FROM users WHERE id=?').get(req.user.id);
+ res.json({user:u});
+});
+app.patch('/api/profile',auth,(req,res)=>{
+ const username=String(req.body.username||'').trim();
+ const email=String(req.body.email||'').trim();
+ const password=String(req.body.password||'');
+ if(username.length<3)return res.status(400).json({error:'Username/Login ID must be at least 3 characters'});
+ if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return res.status(400).json({error:'Enter a valid email address'});
+ if(password && password.length<6)return res.status(400).json({error:'New password must be at least 6 characters'});
+ const dup=db.prepare('SELECT id FROM users WHERE (username=? OR email=?) AND id<>?').get(username,email,req.user.id);
+ if(dup)return res.status(409).json({error:'Username or email is already in use'});
+ if(password){
+   db.prepare('UPDATE users SET username=?,email=?,password_hash=? WHERE id=?').run(username,email,bcrypt.hashSync(password,12),req.user.id);
+ }else{
+   db.prepare('UPDATE users SET username=?,email=? WHERE id=?').run(username,email,req.user.id);
+ }
+ logAction(req.user.id,username,'Profile updated','Username/email/password updated by account owner');
+ const u=db.prepare('SELECT id,username,email,role,active,created_at FROM users WHERE id=?').get(req.user.id);
+ res.json({success:true,user:u,token:tokenFor(u)});
+});
 app.get('/api/users',auth,requirePerm('manage_users'),(req,res)=>res.json(db.prepare('SELECT id,username,email,role,active,created_at FROM users ORDER BY id').all()));
 app.post('/api/users',auth,requirePerm('manage_users'),(req,res)=>{
  const username=String(req.body.username||'').trim(), email=String(req.body.email||'').trim(), password=String(req.body.password||''), role=String(req.body.role||'viewer').toLowerCase();
