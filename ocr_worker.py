@@ -6,7 +6,8 @@ from PIL import Image, ImageOps
 
 PDF = sys.argv[1]
 
-MARK_RE = re.compile(r'(?:\b\d{1,4}\s*/\s*\d{1,4}\s*/\s*\d{1,6}\b)', re.I)
+MARK_RE = re.compile(r'(?:\b16\s*/\s*20\s*/\s*\d{1,6}\b)', re.I)
+WS_MARK_RE = re.compile(r'\bws\s*[-:]?\s*\d{2,8}\b', re.I)
 WS_RE = re.compile(r'\bws\s*[-:]?\s*\d{2,8}\b', re.I)
 EPIC_RE = re.compile(r'\b[A-Z]{2,5}[0-9]{6,10}\b', re.I)
 SERIAL_RE = re.compile(r'^\s*(\d{1,5})\s*$')
@@ -14,11 +15,11 @@ REL_RE = re.compile(r'^(ਪਤੀ|ਪਿਤਾ|ਮਾਤਾ|ਪੁੱਤਰ|ਪ�
 LABEL_RE = re.compile(r'(ਨਾਮ|name|ਮਕਾਨ|house|ਉਮਰ|age|ਲਿੰਗ|gender|ਪਤੀ|ਪਿਤਾ|ਮਾਤਾ|ਪੁੱਤਰ|ਪੁਤਰੀ|father|husband|wife|son|daughter|mother)', re.I)
 
 # Render/OCR can be tuned without changing code. Lower values are much faster on large rolls.
-PAGE_SCALE = float(os.getenv('OCR_PAGE_SCALE', '1.45'))
+PAGE_SCALE = float(os.getenv('OCR_PAGE_SCALE', '1.25'))
 CARD_SCALE = float(os.getenv('OCR_CARD_SCALE', '2.2'))
 MAX_CARD_OCR = int(os.getenv('OCR_MAX_CARD_OCR', '2500'))
 MAX_PARALLEL = max(1, min(int(os.getenv('OCR_PARALLEL', '2')), 4))
-EMBED_OCR_SCALE = float(os.getenv('OCR_EMBED_SCALE', '3.0'))
+EMBED_OCR_SCALE = float(os.getenv('OCR_EMBED_SCALE', '2.0'))
 
 
 def progress(pct, stage, page=None, pages=None):
@@ -37,7 +38,8 @@ def lines(s):
 
 
 def is_marker(s):
-    return bool(MARK_RE.search(clean(s)))
+    s=clean(s)
+    return bool(MARK_RE.search(s) or WS_MARK_RE.search(s))
 
 
 def is_noise(s):
@@ -183,7 +185,7 @@ def exact_card_fields(page,x0,y0,ocr_words=None):
 
 def embedded_rows(page, pno, part, ocr_words=None):
     blocks=page.get_text('blocks'); rows=[]
-    marker_blocks=[b for b in blocks if is_marker(b[4])]
+    marker_blocks=[b for b in blocks if MARK_RE.search(clean(b[4]) or '') or WS_MARK_RE.search(clean(b[4]) or '')]
     for b in marker_blocks:
         text=clean(b[4]); serial=None
         for l in reversed(lines(b[4])):
@@ -191,6 +193,12 @@ def embedded_rows(page, pno, part, ocr_words=None):
         if serial is None: continue
         x0,y0=b[0],b[1]
         name,father,relation,epic,age,gender,house=exact_card_fields(page,x0,y0,ocr_words)
+        if not name or not father:
+            try:
+                n,f,r,_raw=ocr_card(page,x0,y0)
+                name=name or n; father=father or f; relation=relation or r
+            except Exception:
+                pass
         rows.append({'serial_no':str(serial),'name':name,'father_husband':father,'relation':relation,'epic':epic,'age':age,'gender':gender,'house_no':house,'part_no':part,'page_no':pno,'photo_key':f'{pno}:{x0}:{y0}','raw_text':text})
     return rows
 
@@ -260,7 +268,7 @@ def main():
             continue
         # OCR only pages that actually need it. Cover/header pages are skipped when there is no
         # marker signal; image-only voter pages are OCR'd once, not once for every text block.
-        signal=bool(text.strip()) and is_marker(text)
+        signal=bool([b for b in page.get_text('blocks') if MARK_RE.search(clean(b[4]) or '') or WS_MARK_RE.search(clean(b[4]) or '')])
         if not text.strip() or signal:
             try:
                 candidates=scanned_candidates(page)

@@ -267,7 +267,7 @@ app.post('/api/upload',auth,requirePerm('upload'),(req,res,next)=>{
    const uploadId=Number(r.lastInsertRowid);
    logAction(req.user.id,req.user.username,'Upload started',file.originalname);
    processPDF(file.path,uploadId,req.user.username).catch(e=>{
-     db.prepare('UPDATE uploads SET status=?,error=?,progress=0,stage=?,completed_at=CURRENT_TIMESTAMP WHERE id=?').run('Failed',String(e.message||e).slice(-4000),'Failed',uploadId);
+     db.prepare('UPDATE uploads SET status=?,error=?,stage=?,completed_at=CURRENT_TIMESTAMP WHERE id=?').run('Failed',String(e.message||e).slice(-4000),`Failed — ${String(e.message||e).slice(0,220)}`,uploadId);
      logAction(null,req.user.username,'PDF processing failed',String(e.message||e).slice(-1000));
    });
    res.json({success:true,uploadId,fileName:file.originalname});
