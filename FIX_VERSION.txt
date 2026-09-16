@@ -1,0 +1,1 @@
+OCR JSON/progress parser fix v2 - 2026-09-16

@@ -175,32 +175,81 @@ function processPDF(pdfPath, uploadId, username) {
  return new Promise((resolve,reject)=>{
    const workerPath=path.join(__dirname,'ocr_worker.py');
    const py=spawn('python3',[workerPath,pdfPath],{stdio:['ignore','pipe','pipe']});
-   let stdout=''; let stderr=''; let killed=false;
+   let stdout=''; let stderr=''; let stdoutBuf=''; let stderrBuf=''; let killed=false; let settled=false;
    const timeout=setTimeout(()=>{ killed=true; try{py.kill('SIGKILL')}catch{}; }, 20*60*1000);
-   py.stdout.on('data',d=>stdout+=d.toString());
-   py.stderr.on('data',d=>{
-     const chunk=d.toString(); stderr+=chunk;
-     for(const line of chunk.split(/\r?\n/)) {
-       if(!line.startsWith('PROGRESS:')) continue;
-       try {
-         const x=JSON.parse(line.slice(9));
+
+   function handleLine(line, target){
+     const raw=String(line||'').trim();
+     if(!raw) return;
+     if(raw.startsWith('PROGRESS:')){
+       try{
+         const x=JSON.parse(raw.slice('PROGRESS:'.length));
+         const pct=Math.max(0,Math.min(99,Number(x.pct)||0));
+         const pages=Number(x.pages)||0;
+         const page=Number(x.page)||0;
+         const stage=String(x.stage||'Processing');
          db.prepare('UPDATE uploads SET progress=?,stage=?,pages=CASE WHEN ? > 0 THEN ? ELSE pages END WHERE id=?')
-           .run(Number(x.pct||0),`${String(x.stage||'Processing')}${x.page ? ` — page ${x.page}${x.pages ? `/${x.pages}` : ''}` : ''}`,Number(x.pages||0),Number(x.pages||0),uploadId);
-       } catch {}
+           .run(pct,`${stage}${page ? ` — page ${page}${pages ? `/${pages}` : ''}` : ''}`,pages,pages,uploadId);
+       }catch(e){
+         // Ignore malformed progress messages; they must never corrupt the final result.
+       }
+       return;
      }
-   });
-   py.on('error',e=>reject(e));
+     if(target==='stdout') stdout += raw+'\n';
+     else stderr += raw+'\n';
+   }
+
+   function handleChunk(chunk,target){
+     const key=target==='stdout'?'stdoutBuf':'stderrBuf';
+     let buf=(target==='stdout'?stdoutBuf:stderrBuf)+chunk.toString();
+     const parts=buf.split(/\r?\n/);
+     buf=parts.pop()||'';
+     if(target==='stdout') stdoutBuf=buf; else stderrBuf=buf;
+     for(const line of parts) handleLine(line,target);
+   }
+
+   py.stdout.on('data',d=>handleChunk(d,'stdout'));
+   py.stderr.on('data',d=>handleChunk(d,'stderr'));
+   py.on('error',e=>{if(!settled){settled=true;clearTimeout(timeout);reject(e)}});
    py.on('close',code=>{
+     if(settled) return;
+     settled=true;
      clearTimeout(timeout);
+     // Flush the final unterminated lines from either stream.
+     if(stdoutBuf) handleLine(stdoutBuf,'stdout');
+     if(stderrBuf) handleLine(stderrBuf,'stderr');
+
      if(code!==0) return reject(new Error(killed ? 'OCR processing timed out after 20 minutes.' : (stderr||`OCR worker exited with code ${code}`).slice(-4000)));
+
      let result;
-     try { result=JSON.parse(stdout.trim()); } catch { return reject(new Error('OCR worker returned invalid JSON. '+stderr.slice(-1500))); }
-     if(result && result.ok===false) return reject(new Error(result.error || 'OCR worker failed'));
+     try{
+       // The worker's final result is one JSON object. Search from the end so any
+       // harmless diagnostic output before it cannot break parsing.
+       const candidates=stdout.split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
+       let parsed=null;
+       for(let i=candidates.length-1;i>=0;i--){
+         if(!candidates[i].startsWith('{')) continue;
+         try{
+           const x=JSON.parse(candidates[i]);
+           if(x && typeof x==='object' && ('ok' in x || Array.isArray(x.rows))){parsed=x;break;}
+         }catch{}
+       }
+       if(!parsed) throw new Error('No valid worker result JSON found');
+       result=parsed;
+     }catch(e){
+       return reject(new Error(`OCR worker returned invalid JSON. ${e.message}. ${stderr.slice(-1500)}`));
+     }
+     if(result && result.ok===false) return reject(new Error(result.error||'OCR worker failed'));
      if(!Array.isArray(result.rows)) return reject(new Error('OCR worker returned no voter rows'));
-     if(result.rows.length===0) return reject(new Error((result.warnings&&result.warnings[0]) || 'No voter records were detected in this PDF.'));
+     if(result.rows.length===0) return reject(new Error((result.warnings&&result.warnings[0])||'No voter records were detected in this PDF.'));
+
      const rows=result.rows.filter(r=>r && /^\d+$/.test(String(r.serial_no||'')));
+     if(!rows.length) return reject(new Error('Voter rows were returned, but no valid serial numbers were found.'));
      const insert=db.prepare(`INSERT OR REPLACE INTO voters(upload_id,serial_no,name,father_husband,relation,epic,age,gender,house_no,part_no,page_no,photo_key,raw_text) VALUES(@upload_id,@serial_no,@name,@father_husband,@relation,@epic,@age,@gender,@house_no,@part_no,@page_no,@photo_key,@raw_text)`);
-     const tx=db.transaction(items=>{ db.prepare('DELETE FROM voters WHERE upload_id=?').run(uploadId); for(const r of items) insert.run({...r,upload_id:uploadId,serial_no:String(r.serial_no),part_no:String(r.part_no||result.part_no||'')}); });
+     const tx=db.transaction(items=>{
+       db.prepare('DELETE FROM voters WHERE upload_id=?').run(uploadId);
+       for(const r of items) insert.run({...r,upload_id:uploadId,serial_no:String(r.serial_no),part_no:String(r.part_no||result.part_no||'')});
+     });
      tx(rows);
      db.prepare('UPDATE uploads SET status=?,voters=?,pages=?,progress=100,stage=?,completed_at=CURRENT_TIMESTAMP,error=NULL WHERE id=?').run('Completed',rows.length,Number(result.pages||0),'Completed',uploadId);
      logAction(null,username,'PDF processed',`${rows.length} voters, Part ${result.part_no||''}, ${result.pages||0} pages, ${result.elapsed_seconds||0}s`);
