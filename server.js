@@ -51,6 +51,8 @@ CREATE TABLE IF NOT EXISTS uploads (
  status TEXT NOT NULL DEFAULT 'Processing',
  voters INTEGER NOT NULL DEFAULT 0,
  pages INTEGER NOT NULL DEFAULT 0,
+ progress INTEGER NOT NULL DEFAULT 0,
+ stage TEXT NOT NULL DEFAULT 'Queued',
  error TEXT,
  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
  completed_at TEXT
@@ -86,6 +88,12 @@ CREATE TABLE IF NOT EXISTS logs (
  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 `);
+
+// Safe migrations for databases created by older versions.
+for (const stmt of [
+  "ALTER TABLE uploads ADD COLUMN progress INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE uploads ADD COLUMN stage TEXT NOT NULL DEFAULT 'Queued'"
+]) { try { db.exec(stmt); } catch (e) { if (!String(e.message).includes('duplicate column name')) throw e; } }
 
 function ensureAdmin() {
  const existing = db.prepare('SELECT id FROM users WHERE username=?').get('admin');
@@ -167,16 +175,26 @@ function processPDF(pdfPath, uploadId, username) {
  return new Promise((resolve,reject)=>{
    const workerPath=path.join(__dirname,'ocr_worker.py');
    const py=spawn('python3',[workerPath,pdfPath],{stdio:['ignore','pipe','pipe']});
-   let stdout=''; let stderr='';
-   const timeout=setTimeout(()=>{ try{py.kill('SIGKILL')}catch{}; }, 15*60*1000);
+   let stdout=''; let stderr=''; let killed=false;
+   const timeout=setTimeout(()=>{ killed=true; try{py.kill('SIGKILL')}catch{}; }, 20*60*1000);
    py.stdout.on('data',d=>stdout+=d.toString());
-   py.stderr.on('data',d=>stderr+=d.toString());
-   py.on('error',reject);
+   py.stderr.on('data',d=>{
+     const chunk=d.toString(); stderr+=chunk;
+     for(const line of chunk.split(/\r?\n/)) {
+       if(!line.startsWith('PROGRESS:')) continue;
+       try {
+         const x=JSON.parse(line.slice(9));
+         db.prepare('UPDATE uploads SET progress=?,stage=?,pages=CASE WHEN ? > 0 THEN ? ELSE pages END WHERE id=?')
+           .run(Number(x.pct||0),`${String(x.stage||'Processing')}${x.page ? ` — page ${x.page}${x.pages ? `/${x.pages}` : ''}` : ''}`,Number(x.pages||0),Number(x.pages||0),uploadId);
+       } catch {}
+     }
+   });
+   py.on('error',e=>reject(e));
    py.on('close',code=>{
      clearTimeout(timeout);
-     if(code!==0) return reject(new Error((stderr||`OCR worker exited with code ${code}`).slice(-4000)));
+     if(code!==0) return reject(new Error(killed ? 'OCR processing timed out after 20 minutes.' : (stderr||`OCR worker exited with code ${code}`).slice(-4000)));
      let result;
-     try { result=JSON.parse(stdout); } catch { return reject(new Error('OCR worker returned invalid JSON. '+stderr.slice(-1000))); }
+     try { result=JSON.parse(stdout.trim()); } catch { return reject(new Error('OCR worker returned invalid JSON. '+stderr.slice(-1500))); }
      if(result && result.ok===false) return reject(new Error(result.error || 'OCR worker failed'));
      if(!Array.isArray(result.rows)) return reject(new Error('OCR worker returned no voter rows'));
      if(result.rows.length===0) return reject(new Error((result.warnings&&result.warnings[0]) || 'No voter records were detected in this PDF.'));
@@ -184,8 +202,8 @@ function processPDF(pdfPath, uploadId, username) {
      const insert=db.prepare(`INSERT OR REPLACE INTO voters(upload_id,serial_no,name,father_husband,relation,epic,age,gender,house_no,part_no,page_no,photo_key,raw_text) VALUES(@upload_id,@serial_no,@name,@father_husband,@relation,@epic,@age,@gender,@house_no,@part_no,@page_no,@photo_key,@raw_text)`);
      const tx=db.transaction(items=>{ db.prepare('DELETE FROM voters WHERE upload_id=?').run(uploadId); for(const r of items) insert.run({...r,upload_id:uploadId,serial_no:String(r.serial_no),part_no:String(r.part_no||result.part_no||'')}); });
      tx(rows);
-     db.prepare('UPDATE uploads SET status=?,voters=?,pages=?,completed_at=CURRENT_TIMESTAMP,error=NULL WHERE id=?').run('Completed',rows.length,Number(result.pages||0),uploadId);
-     logAction(null,username,'PDF processed',`${rows.length} voters, Part ${result.part_no||''}, ${result.pages||0} pages`);
+     db.prepare('UPDATE uploads SET status=?,voters=?,pages=?,progress=100,stage=?,completed_at=CURRENT_TIMESTAMP,error=NULL WHERE id=?').run('Completed',rows.length,Number(result.pages||0),'Completed',uploadId);
+     logAction(null,username,'PDF processed',`${rows.length} voters, Part ${result.part_no||''}, ${result.pages||0} pages, ${result.elapsed_seconds||0}s`);
      resolve({count:rows.length,pages:Number(result.pages||0),part_no:String(result.part_no||'')});
    });
  });
@@ -196,18 +214,18 @@ app.post('/api/upload',auth,requirePerm('upload'),(req,res,next)=>{
    if(err) return res.status(400).json({error:err.message || 'Upload failed'});
    const file=(req.files||[])[0];
    if(!file) return res.status(400).json({error:'PDF file required'});
-   const r=db.prepare('INSERT INTO uploads(file_name,file_path,username,status) VALUES(?,?,?,?)').run(file.originalname,file.path,req.user.username,'Processing');
+   const r=db.prepare('INSERT INTO uploads(file_name,file_path,username,status,progress,stage) VALUES(?,?,?,?,?,?)').run(file.originalname,file.path,req.user.username,'Processing',1,'Starting');
    const uploadId=Number(r.lastInsertRowid);
    logAction(req.user.id,req.user.username,'Upload started',file.originalname);
    processPDF(file.path,uploadId,req.user.username).catch(e=>{
-     db.prepare('UPDATE uploads SET status=?,error=?,completed_at=CURRENT_TIMESTAMP WHERE id=?').run('Failed',String(e.message||e).slice(-4000),uploadId);
+     db.prepare('UPDATE uploads SET status=?,error=?,progress=0,stage=?,completed_at=CURRENT_TIMESTAMP WHERE id=?').run('Failed',String(e.message||e).slice(-4000),'Failed',uploadId);
      logAction(null,req.user.username,'PDF processing failed',String(e.message||e).slice(-1000));
    });
    res.json({success:true,uploadId,fileName:file.originalname});
  });
 });
 
-app.get('/api/history',auth,requirePerm('history'),(req,res)=>res.json(db.prepare('SELECT id,file_name,username,status,voters,pages,error,created_at,completed_at FROM uploads ORDER BY id DESC LIMIT 100').all()));
+app.get('/api/history',auth,requirePerm('history'),(req,res)=>res.json(db.prepare('SELECT id,file_name,username,status,voters,pages,progress,stage,error,created_at,completed_at FROM uploads ORDER BY id DESC LIMIT 100').all()));
 app.get('/api/logs',auth,requirePerm('logs'),(req,res)=>res.json(db.prepare('SELECT id,username,action,detail,created_at FROM logs ORDER BY id DESC LIMIT 200').all()));
 
 app.get('/api/search',auth,requirePerm('search'),(req,res)=>{

@@ -23,3 +23,11 @@ Default admin username: `admin`.
 - The boxed/standalone numeric serial is the record key.
 - OCR failures are returned to Processing History with the worker error instead of a generic JSON failure.
 - Photo requests accept the authenticated browser token used by the search UI.
+
+
+## Performance update
+- Embedded-text voter cards use the PDF text layer first and avoid per-card Tesseract OCR when a plausible name is already available.
+- Scanned pages use a single lower-DPI Punjabi+English OCR pass to locate serial markers, then limited card OCR only for the detected cards.
+- Conservative parallel card OCR and configurable OCR environment variables reduce CPU/RAM pressure on Render.
+- Worker progress is reported to the server, so the UI no longer artificially stops at 88%; it shows the worker stage/page and reaches 100% only after database insertion completes.
+- OCR worker timeout is 20 minutes with a clear Processing History error.
