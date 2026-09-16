@@ -62,7 +62,9 @@ CREATE TABLE IF NOT EXISTS voters (
  upload_id INTEGER NOT NULL,
  serial_no TEXT NOT NULL,
  name TEXT,
+ name_en TEXT,
  father_husband TEXT,
+ father_husband_en TEXT,
  relation TEXT,
  epic TEXT,
  age INTEGER,
@@ -93,6 +95,10 @@ CREATE TABLE IF NOT EXISTS logs (
 for (const stmt of [
   "ALTER TABLE uploads ADD COLUMN progress INTEGER NOT NULL DEFAULT 0",
   "ALTER TABLE uploads ADD COLUMN stage TEXT NOT NULL DEFAULT 'Queued'"
+]) { try { db.exec(stmt); } catch (e) { if (!String(e.message).includes('duplicate column name')) throw e; } }
+for (const stmt of [
+  "ALTER TABLE voters ADD COLUMN name_en TEXT",
+  "ALTER TABLE voters ADD COLUMN father_husband_en TEXT"
 ]) { try { db.exec(stmt); } catch (e) { if (!String(e.message).includes('duplicate column name')) throw e; } }
 
 function ensureAdmin() {
@@ -245,7 +251,7 @@ function processPDF(pdfPath, uploadId, username) {
 
      const rows=result.rows.filter(r=>r && /^\d+$/.test(String(r.serial_no||'')));
      if(!rows.length) return reject(new Error('Voter rows were returned, but no valid serial numbers were found.'));
-     const insert=db.prepare(`INSERT OR REPLACE INTO voters(upload_id,serial_no,name,father_husband,relation,epic,age,gender,house_no,part_no,page_no,photo_key,raw_text) VALUES(@upload_id,@serial_no,@name,@father_husband,@relation,@epic,@age,@gender,@house_no,@part_no,@page_no,@photo_key,@raw_text)`);
+     const insert=db.prepare(`INSERT OR REPLACE INTO voters(upload_id,serial_no,name,name_en,father_husband,father_husband_en,relation,epic,age,gender,house_no,part_no,page_no,photo_key,raw_text) VALUES(@upload_id,@serial_no,@name,@name_en,@father_husband,@father_husband_en,@relation,@epic,@age,@gender,@house_no,@part_no,@page_no,@photo_key,@raw_text)`);
      const tx=db.transaction(items=>{
        db.prepare('DELETE FROM voters WHERE upload_id=?').run(uploadId);
        for(const r of items) insert.run({...r,upload_id:uploadId,serial_no:String(r.serial_no),part_no:String(r.part_no||result.part_no||'')});
@@ -288,20 +294,20 @@ app.get('/api/search',auth,requirePerm('search'),(req,res)=>{
  const offset=Math.max(Number(req.query.offset||0),0);
  const conditions=[]; const params=[];
  const col={name:'name',father:'father_husband',husband:'father_husband',epic:'epic',house:'house_no',serial:'serial_no'}[field] || 'name';
- if(q){ conditions.push(`LOWER(COALESCE(${col},'')) LIKE LOWER(?)`); params.push(`%${q}%`); }
+ if(q){ if(field==='name'){ conditions.push(`(LOWER(COALESCE(name,'')) LIKE LOWER(?) OR LOWER(COALESCE(name_en,'')) LIKE LOWER(?))`); params.push(`%${q}%`,`%${q}%`); } else { conditions.push(`LOWER(COALESCE(${col},'')) LIKE LOWER(?)`); params.push(`%${q}%`); } }
  if(gender && gender!=='All') { conditions.push(`LOWER(COALESCE(gender,'')) LIKE LOWER(?)`); params.push(`%${gender}%`); }
  if(age && age!=='All') { const m=age.match(/(\d+)\s*[-–]\s*(\d+)/); if(m){conditions.push('age BETWEEN ? AND ?');params.push(Number(m[1]),Number(m[2]));} else if(/^\d+$/.test(age)){conditions.push('age=?');params.push(Number(age));} }
  if(part && part!=='All'){conditions.push('part_no=?');params.push(part)}
  if(page && page!=='All'){conditions.push('page_no=?');params.push(Number(page))}
  const where=conditions.length?'WHERE '+conditions.join(' AND '):'';
  const total=db.prepare(`SELECT COUNT(*) c FROM voters ${where}`).get(...params).c;
- const rows=db.prepare(`SELECT id,serial_no,name,father_husband,relation,epic,age,gender,house_no,part_no,page_no FROM voters ${where} ORDER BY CAST(serial_no AS INTEGER),id LIMIT ? OFFSET ?`).all(...params,limit,offset);
+ const rows=db.prepare(`SELECT id,serial_no,name,name_en,father_husband,father_husband_en,relation,epic,age,gender,house_no,part_no,page_no FROM voters ${where} ORDER BY CAST(serial_no AS INTEGER),id LIMIT ? OFFSET ?`).all(...params,limit,offset);
  res.json({total,rows,limit,offset});
 });
 app.get('/api/voters',auth,requirePerm('search'),(req,res)=>{
   const q=String(req.query.q||'').trim(); const limit=Math.min(Math.max(Number(req.query.limit||24),1),100); const offset=Math.max(Number(req.query.offset||0),0);
   const total=db.prepare('SELECT COUNT(*) c FROM voters WHERE name LIKE ? OR father_husband LIKE ? OR epic LIKE ? OR house_no LIKE ? OR serial_no LIKE ?').get(`%${q}%`,`%${q}%`,`%${q}%`,`%${q}%`,`%${q}%`).c;
-  const rows=db.prepare('SELECT id,serial_no,name,father_husband,relation,epic,age,gender,house_no,part_no,page_no FROM voters WHERE name LIKE ? OR father_husband LIKE ? OR epic LIKE ? OR house_no LIKE ? OR serial_no LIKE ? ORDER BY CAST(serial_no AS INTEGER),id LIMIT ? OFFSET ?').all(`%${q}%`,`%${q}%`,`%${q}%`,`%${q}%`,`%${q}%`,limit,offset);
+  const rows=db.prepare('SELECT id,serial_no,name,name_en,father_husband,father_husband_en,relation,epic,age,gender,house_no,part_no,page_no FROM voters WHERE name LIKE ? OR father_husband LIKE ? OR epic LIKE ? OR house_no LIKE ? OR serial_no LIKE ? ORDER BY CAST(serial_no AS INTEGER),id LIMIT ? OFFSET ?').all(`%${q}%`,`%${q}%`,`%${q}%`,`%${q}%`,`%${q}%`,limit,offset);
   res.json({total,rows,limit,offset});
 });
 
@@ -324,7 +330,7 @@ app.get('/api/voter-photo/:id',(req,res,next)=>{
 
 app.get('/api/export/:id',auth,requirePerm('history'),(req,res)=>{
  const uploadId=Number(req.params.id); const u=db.prepare('SELECT id,file_name,username,status,voters,pages,created_at FROM uploads WHERE id=?').get(uploadId); if(!u)return res.status(404).json({error:'Upload not found'});
- const voters=db.prepare('SELECT serial_no,name,father_husband,relation,epic,age,gender,house_no,part_no,page_no FROM voters WHERE upload_id=? ORDER BY CAST(serial_no AS INTEGER),id').all(uploadId);
+ const voters=db.prepare('SELECT serial_no,name,name_en,father_husband,father_husband_en,relation,epic,age,gender,house_no,part_no,page_no FROM voters WHERE upload_id=? ORDER BY CAST(serial_no AS INTEGER),id').all(uploadId);
  res.json({upload:u,voters});
 });
 

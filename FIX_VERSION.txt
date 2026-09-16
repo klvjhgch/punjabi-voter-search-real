@@ -1,1 +1,1 @@
-Fixed V4 - accurate Punjabi OCR fields for the supplied Punjab voter-roll layout; Booth=Part; voter photos; Super Admin profile editing.
+V7 - tight-card Punjabi OCR + Romanized names + exact PDF photo crop; avoids full-page OCR on embedded-text rolls.

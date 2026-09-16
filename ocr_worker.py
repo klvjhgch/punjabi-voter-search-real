@@ -100,87 +100,143 @@ def crop_ocr(page, rect, psm=6):
         except Exception:return ''
 
 
-def page_ocr_words(page, scale=4.0):
-    pix=page.get_pixmap(matrix=fitz.Matrix(scale,scale),alpha=False)
+def ocr_name_pair(page, x0, y0):
+    """OCR only the printed name + relative-name lines of one voter card.
+    This avoids the expensive full-page OCR that caused 35%/timeouts on Render.
+    """
+    rect=fitz.Rect(x0+25, y0+15, x0+132, y0+47)
+    pix=page.get_pixmap(matrix=fitz.Matrix(4.5,4.5), clip=rect, alpha=False)
     img=Image.frombytes('RGB',[pix.width,pix.height],pix.samples)
+    img=ImageOps.grayscale(img)
     try:
-        data=pytesseract.image_to_data(img,lang='pan',config='--oem 1 --psm 11',output_type=pytesseract.Output.DICT)
+        txt=pytesseract.image_to_string(img,lang='pan',config='--oem 1 --psm 6')
     except Exception:
-        data=pytesseract.image_to_data(img,lang='pan+eng',config='--oem 1 --psm 11',output_type=pytesseract.Output.DICT)
-    out=[]
-    for i,t in enumerate(data.get('text',[])):
-        t=clean(t)
-        if not t: continue
-        try: conf=float(data['conf'][i])
-        except: conf=0
-        out.append({'t':t,'x':int(data['left'][i])/scale,'y':int(data['top'][i])/scale,
-                    'w':int(data['width'][i])/scale,'h':int(data['height'][i])/scale,'conf':conf})
-    return out
+        txt=pytesseract.image_to_string(img,lang='pan+eng',config='--oem 1 --psm 6')
+    vals=[normalize_name_text(x) for x in str(txt).splitlines() if clean(x)]
+    vals=[x for x in vals if not re.search(r'^(?:ਨਾਮ|ਪਿਤਾ|ਪਤੀ|ਮਾਤਾ|ਮਕਾਨ|ਉਮਰ|ਲਿੰਗ|Name|Father|Husband)',x,re.I)]
+    return (vals[0] if len(vals)>0 else '', vals[1] if len(vals)>1 else '')
 
+# Punjabi -> Roman/English transliteration. Original Punjabi is retained in `name` and
+# `father_husband`; the Roman forms are stored separately for display/search.
+VOWELS={'ਾ':'aa','ਿ':'i','ੀ':'ee','ੁ':'u','ੂ':'oo','ੇ':'e','ੈ':'ai','ੋ':'o','ੌ':'au'}
+CONS={'ਕ':'k','ਖ':'kh','ਗ':'g','ਘ':'gh','ਙ':'ng','ਚ':'ch','ਛ':'chh','ਜ':'j','ਝ':'jh','ਞ':'ny','ਟ':'t','ਠ':'th','ਡ':'d','ਢ':'dh','ਣ':'n','ਤ':'t','ਥ':'th','ਦ':'d','ਧ':'dh','ਨ':'n','ਪ':'p','ਫ':'ph','ਬ':'b','ਭ':'bh','ਮ':'m','ਯ':'y','ਰ':'r','ਲ':'l','ਵ':'v','ੜ':'r','ਸ':'s','ਹ':'h','ਸ਼':'sh','ਸ਼':'sh','ਖ਼':'kh','ਗ਼':'gh','ਜ਼':'z','ਫ਼':'f','ਲ਼':'l','ਕ਼':'q'}
+SIGNS={'ੰ':'n','ਂ':'n','ੱ':'','਼':'','੍':''}
 
-def words_in(words,x1,y1,x2,y2):
-    return sorted([w for w in words if x1<=w['x']<=x2 and y1<=w['y']<=y2],key=lambda w:(w['y'],w['x']))
-
-
-def join_words(ws):
-    if not ws:return ''
-    # Tesseract may place two words on the same printed line at slightly different
-    # y-coordinates. Cluster by baseline first, then preserve left-to-right order.
-    ordered=sorted(ws,key=lambda w:(w['y'],w['x']))
-    groups=[]
-    for w in ordered:
-        if not groups or abs(w['y']-groups[-1][0])>3.0:
-            groups.append([w['y'],[w]])
-        else:
-            groups[-1][1].append(w)
-            groups[-1][0]=(groups[-1][0]+w['y'])/2
-    return clean(' '.join(w['t'] for _,items in groups for w in sorted(items,key=lambda z:z['x'])))
+def romanize_gurmukhi(text):
+    text=clean(text)
+    out=[]; i=0
+    while i<len(text):
+        ch=text[i]
+        if ch.isspace():
+            out.append(' '); i+=1; continue
+        if ch in VOWELS:
+            # Independent vowel signs are uncommon at word start; keep readable Roman form.
+            out.append(VOWELS[ch]); i+=1; continue
+        if ch in ('ੰ','ਂ'):
+            out.append('n'); i+=1; continue
+        if ch=='ੱ':
+            # Add a consonant doubling marker only when there is a previous consonant.
+            if out and out[-1] and out[-1][-1].isalpha(): out[-1]+=out[-1][-1]
+            i+=1; continue
+        if ch=='਼': i+=1; continue
+        if ch=='੍': i+=1; continue
+        if ch in CONS:
+            base=CONS[ch]; i+=1
+            # Nukta is represented as a separate sign in some OCR outputs.
+            if i<len(text) and text[i]=='਼': i+=1
+            # Consonant cluster: virama suppresses inherent a and the next consonant follows.
+            if i<len(text) and text[i]=='੍':
+                i+=1
+                if i<len(text) and text[i] in CONS:
+                    out.append(base); continue
+            if i<len(text) and text[i] in VOWELS:
+                out.append(base+VOWELS[text[i]]); i+=1
+            else:
+                out.append(base+'a')
+            continue
+        if ch in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-': out.append(ch)
+        i+=1
+    result=''.join(out)
+    result=re.sub(r'\ba\b','',result)
+    result=re.sub(r'([A-Za-z])a(?=\s|$)',r'\1',result)
+    result=re.sub(r'aa','a',result); result=re.sub(r'ee','i',result); result=re.sub(r'oo','u',result)
+    result=re.sub(r'(?i)saingh','singh',result); result=re.sub(r'(?i)saingha','singh',result)
+    replacements={
+      'Ravee':'Ravi','Prakaas':'Prakash','Baladev':'Baldev','Jasavindar':'Jaswinder',
+      'Kumaaree':'Kumari','Kumaar':'Kumar','Raaj':'Raj','Varindar':'Varinder',
+      'Rajindar':'Rajinder','Jagan Naath':'Jagannath','Chaman Laal':'Chaman Lal',
+      'Jasavanta':'Jaswant','Santos':'Santosh','Jagadees':'Jagdish','Manindar':'Maninder',
+      'Samaser':'Samsher','Paradeep':'Pradeep','Vije':'Vijay','Ravindar':'Ravinder',
+      'Surindar':'Surinder','Davindar':'Davinder','Haravindar':'Harvinder','Guravindar':'Gurvinder'
+    }
+    words=[]
+    for w in result.split(): words.append(replacements.get(w,w))
+    result=' '.join(words)
+    return ' '.join(w[:1].upper()+w[1:] if w else w for w in result.split())
 
 
 def normalize_name_text(s):
     s=clean(s)
     s=re.sub(r'[_|`~]+','',s)
     s=re.sub(r'\s*[-–—]+\s*$','',s)
-    # A few stable OCR substitutions in this Punjabi electoral-roll font.
     s=re.sub(r'(?<!\S)ਕਮਾਰ(?!\S)','ਕੁਮਾਰ',s)
     s=re.sub(r'(?<!\S)ਕੋਰ(?!\S)','ਕੌਰ',s)
     return clean(s)
 
 
+def page_name_ocr_words(page, scale=2.0):
+    # OCR only the voter-card body, not the header/footer/photos. One pass per page is
+    # substantially faster than launching Tesseract once per voter card.
+    clip=fitz.Rect(0,65,575,805)
+    pix=page.get_pixmap(matrix=fitz.Matrix(scale,scale),clip=clip,alpha=False)
+    img=Image.frombytes('RGB',[pix.width,pix.height],pix.samples)
+    data=pytesseract.image_to_data(img,lang='pan',config='--oem 1 --psm 6',output_type=pytesseract.Output.DICT)
+    out=[]
+    for i,t in enumerate(data.get('text',[])):
+        t=clean(t)
+        if not t: continue
+        try: conf=float(data['conf'][i])
+        except: conf=0
+        x=int(data['left'][i])/scale; y=int(data['top'][i])/scale+65
+        w=int(data['width'][i])/scale; h=int(data['height'][i])/scale
+        out.append({'t':t,'x':x,'y':y,'w':w,'h':h,'conf':conf})
+    return out
+
+def card_ocr_from_words(words,x0,y0):
+    # Names and relative names are the two printed lines immediately below the labels.
+    def get(y1,y2,x1=x0+27,x2=x0+133):
+        ws=[w for w in words if x1<=w['x']<=x2 and y1<=w['y']<=y2 and w['conf']>=20]
+        return clean(' '.join(w['t'] for w in sorted(ws,key=lambda z:(z['y'],z['x']))))
+    name=get(y0+15,y0+29)
+    father=get(y0+29,y0+45)
+    return normalize_name_text(name),normalize_name_text(father)
+
 def exact_card_fields(page,x0,y0,ocr_words=None):
     blocks=page.get_text('blocks')
-    # Tight vertical band prevents an adjacent row's EPIC/fields from leaking into this card.
+    # This roll uses a fixed 3-column card grid. The text layer contains reliable
+    # geometry for EPIC/age/gender/house, while Punjabi names are OCR'd from tiny crops.
     card=[b for b in blocks if b[0]>=x0-3 and b[0]<=x0+173 and b[1]>=y0-3 and b[1]<=y0+69]
     epic=''; house=''; age=None; gender=''; relation=''
     for b in card:
         bx,by,bx1,by1,t=b[:5]; ss=clean(t)
         em=EPIC_RE.search(ss.upper())
         if em and by<=y0+15: epic=em.group(0).upper()
-        if abs(by-(y0+47))<7 and x0+25<=bx<=x0+85 and not re.search(r'(?:ਮਕਾਨ|ਮਪਪਨ|house|ਜਲਨਗ)',ss,re.I):
+        if abs(by-(y0+47))<8 and x0+20<=bx<=x0+90 and not re.search(r'(?:ਮਕਾਨ|ਮਪਪਨ|house|ਜਲਨਗ)',ss,re.I):
             house=ss
-        if abs(by-(y0+59))<8 and x0+30<=bx<=x0+155:
+        if abs(by-(y0+59))<9 and x0+25<=bx<=x0+155:
             m=re.search(r'(?<!\d)(\d{1,3})(?!\d)',ss)
             if m: age=int(m.group(1))
             gender=normalize_gender(ss)
-        if abs(by-(y0+32))<9 and x0-1<=bx<=x0+10:
+        if abs(by-(y0+32))<10 and x0-1<=bx<=x0+12:
             relation=normalize_relation(ss)
     if ocr_words:
-        # Exact printed coordinates for this 3-column/10-row electoral-roll grid.
-        nw=[w for w in words_in(ocr_words,x0+28,y0+14,x0+155,y0+25) if w['conf']>=45]
-        fw=[w for w in words_in(ocr_words,x0+15,y0+24,x0+165,y0+42.5) if w['conf']>=15]
-        name=join_words(nw)
-        father=join_words(fw)
-        # The father/relative line may include the relation label when OCR spans both.
-        m=re.match(r'^(ਪਿਤਾ|ਪਤੀ|ਮਾਤਾ|ਪੁੱਤਰ|ਪੁਤਰੀ|father|husband|mother|son|daughter)\s+(.+)$',father,re.I)
-        if m:
-            relation=normalize_relation(m.group(1)); father=clean(m.group(2))
-        # Drop common OCR punctuation/noise at the ends.
-        name=normalize_name_text(name)
-        father=normalize_name_text(father)
-        # Remove obvious field labels accidentally captured by OCR.
-        name=re.sub(r'^(?:ਨਾਮ|Name)\s*[:：-]?\s*','',name,flags=re.I)
-        father=re.sub(r'^(?:ਪਿਤਾ|ਪਤੀ|ਮਾਤਾ|ਪੁੱਤਰ|ਪੁਤਰੀ|father|husband|mother|son|daughter)\s*[:：-]?\s*','',father,flags=re.I)
-    return name if 'name' in locals() else '', father if 'father' in locals() else '', relation, epic, age, gender, house
+        name,father=card_ocr_from_words(ocr_words,x0,y0)
+    else:
+        name,father=ocr_name_pair(page,x0,y0)
+    # If OCR accidentally includes the field label, remove it.
+    name=re.sub(r'^(?:ਨਾਮ|Name)\s*[:：-]?\s*','',name,flags=re.I)
+    father=re.sub(r'^(?:ਪਿਤਾ|ਪਤੀ|ਮਾਤਾ|ਪੁੱਤਰ|ਪੁਤਰੀ|father|husband|mother|son|daughter)\s*[:：-]?\s*','',father,flags=re.I)
+    return name,father,relation,epic,age,gender,house
 
 
 def embedded_rows(page, pno, part, ocr_words=None):
@@ -193,13 +249,7 @@ def embedded_rows(page, pno, part, ocr_words=None):
         if serial is None: continue
         x0,y0=b[0],b[1]
         name,father,relation,epic,age,gender,house=exact_card_fields(page,x0,y0,ocr_words)
-        if not name or not father:
-            try:
-                n,f,r,_raw=ocr_card(page,x0,y0)
-                name=name or n; father=father or f; relation=relation or r
-            except Exception:
-                pass
-        rows.append({'serial_no':str(serial),'name':name,'father_husband':father,'relation':relation,'epic':epic,'age':age,'gender':gender,'house_no':house,'part_no':part,'page_no':pno,'photo_key':f'{pno}:{x0}:{y0}','raw_text':text})
+        rows.append({'serial_no':str(serial),'name':name,'name_en':romanize_gurmukhi(name),'father_husband':father,'father_husband_en':romanize_gurmukhi(father),'relation':relation,'epic':epic,'age':age,'gender':gender,'house_no':house,'part_no':part,'page_no':pno,'photo_key':f'{pno}:{x0}:{y0}','raw_text':text})
     return rows
 
 
@@ -248,9 +298,11 @@ def scanned_row(page,pno,part,item):
     x,y,serial=item
     name,father,relation,epic,age,gender,house=exact_card_fields(page,x,y)
     if not name or not father:
-        n,f,r,raw=ocr_card(page,x,y)
-        name=name or n; father=father or f; relation=relation or r
-    return {'serial_no':str(serial),'name':name,'father_husband':father,'relation':relation,'epic':epic,'age':age,'gender':gender,'house_no':house,'part_no':part,'page_no':pno,'photo_key':f'{pno}:{x}:{y}','raw_text':''}
+        try:
+            n,f=ocr_name_pair(page,x,y)
+            name=name or n; father=father or f
+        except Exception: pass
+    return {'serial_no':str(serial),'name':name,'name_en':romanize_gurmukhi(name),'father_husband':father,'father_husband_en':romanize_gurmukhi(father),'relation':relation,'epic':epic,'age':age,'gender':gender,'house_no':house,'part_no':part,'page_no':pno,'photo_key':f'{pno}:{x}:{y}','raw_text':''}
 
 
 def main():
@@ -261,7 +313,7 @@ def main():
         text=page.get_text('text')
         # The embedded text has correct field geometry but corrupted Punjabi Unicode mapping.
         # One 4x page OCR pass restores the printed Punjabi names/relative names/gender.
-        er=embedded_rows(page,pno,part,page_ocr_words(page,EMBED_OCR_SCALE) if text.strip() else None)
+        er=embedded_rows(page,pno,part,None)
         if er:
             rows.extend(er)
             progress(10 + int(78*(pno/total)), 'Reading embedded text + Punjabi OCR', pno, total)
